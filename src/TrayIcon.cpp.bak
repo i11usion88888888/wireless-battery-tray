@@ -1,0 +1,280 @@
+#include "TrayIcon.h"
+
+#include <shellapi.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <iterator>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+constexpr UINT kTrayMessage = WM_APP + 1;
+constexpr UINT_PTR kTimerId = 1;
+constexpr UINT kTrayIconId = 1;
+constexpr UINT kCmdRefresh = 1001;
+constexpr UINT kCmdExit = 1002;
+constexpr wchar_t kWindowClass[] = L"WirelessBatteryTrayWindow";
+
+COLORREF BackgroundFor(int percent) {
+    if (percent < 0) return RGB(110, 110, 110);  // unknown
+    if (percent < 20) return RGB(200, 40, 40);   // low
+    if (percent < 40) return RGB(214, 120, 0);   // medium
+    return RGB(0, 140, 70);                      // ok
+}
+
+// Draws the percentage onto a small square and turns it into an HICON.
+// The caller owns the result and must DestroyIcon it. Returns nullptr on failure.
+HICON CreatePercentIcon(int percent) {
+    const int size = std::max(16, GetSystemMetrics(SM_CXSMICON));
+    percent = std::min(percent, 100);
+
+    HDC screen = GetDC(nullptr);
+    if (!screen) return nullptr;
+    HDC dc = CreateCompatibleDC(screen);
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = size;
+    bi.bmiHeader.biHeight = -size;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP color = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+
+    HICON icon = nullptr;
+    if (color && bits) {
+        HGDIOBJ oldBitmap = SelectObject(dc, color);
+
+        RECT rect{0, 0, size, size};
+        HBRUSH brush = CreateSolidBrush(BackgroundFor(percent));
+        FillRect(dc, &rect, brush);
+        DeleteObject(brush);
+
+        const std::wstring text = percent < 0 ? L"?" : std::to_wstring(percent);
+        const int fontHeight = text.size() >= 3 ? size * 11 / 20 : size * 3 / 4;
+        HFONT font = CreateFontW(-fontHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                                 L"Segoe UI");
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        DrawTextW(dc, text.c_str(), -1, &rect,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        GdiFlush();
+
+        // GDI leaves the alpha channel at 0; make every pixel opaque.
+        auto* pixels = static_cast<std::uint32_t*>(bits);
+        for (int i = 0; i < size * size; ++i) pixels[i] |= 0xFF000000u;
+
+        // All-zero AND mask: the color bitmap is shown as-is.
+        const std::size_t maskBytes = static_cast<std::size_t>((size + 15) / 16) * 2 * size;
+        std::vector<BYTE> maskBits(maskBytes, 0);
+        HBITMAP mask = CreateBitmap(size, size, 1, 1, maskBits.data());
+
+        ICONINFO info{};
+        info.fIcon = TRUE;
+        info.hbmMask = mask;
+        info.hbmColor = color;
+        icon = CreateIconIndirect(&info);
+
+        SelectObject(dc, oldBitmap);
+        if (mask) DeleteObject(mask);
+    }
+
+    if (color) DeleteObject(color);
+    if (dc) DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+    return icon;
+}
+
+void CopyTooltip(NOTIFYICONDATAW& nid, const std::wstring& text) {
+    const std::size_t capacity = std::size(nid.szTip) - 1;
+    const std::size_t length = std::min(text.size(), capacity);
+    std::copy_n(text.begin(), length, nid.szTip);
+    nid.szTip[length] = L'\0';
+}
+
+} // namespace
+
+TrayIcon::TrayIcon(HINSTANCE instance) : instance_(instance) {}
+
+TrayIcon::~TrayIcon() {
+    if (hwnd_) DestroyWindow(hwnd_);
+    if (icon_) DestroyIcon(icon_);
+}
+
+bool TrayIcon::Create(Callbacks callbacks, UINT refreshIntervalMs) {
+    callbacks_ = std::move(callbacks);
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = &TrayIcon::WndProc;
+    wc.hInstance = instance_;
+    wc.lpszClassName = kWindowClass;
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
+
+    // A normal (never shown) top-level window rather than a message-only
+    // window: message-only windows do not receive the "TaskbarCreated"
+    // broadcast, which we need to restore the icon after Explorer restarts.
+    taskbarCreatedMsg_ = RegisterWindowMessageW(L"TaskbarCreated");
+    hwnd_ = CreateWindowExW(0, kWindowClass, L"Wireless Battery Tray", WS_OVERLAPPED, 0, 0, 0, 0,
+                            nullptr, nullptr, instance_, this);
+    if (!hwnd_) return false;
+
+    icon_ = CreatePercentIcon(-1);
+    if (!icon_) return false;
+    tooltip_ = L"Wireless Battery Tray - scanning...";
+    // If this fails, Explorer is probably not ready yet (e.g. right after
+    // logon); the TaskbarCreated message will add the icon later.
+    AddIcon();
+
+    SetTimer(hwnd_, kTimerId, refreshIntervalMs, nullptr);
+    return true;
+}
+
+void TrayIcon::Update(int percent, const std::wstring& tooltip) {
+    if (!hwnd_) return;
+
+    HICON newIcon = CreatePercentIcon(percent);
+    if (!newIcon) return;  // keep the previous icon
+
+    HICON oldIcon = icon_;
+    icon_ = newIcon;
+    tooltip_ = tooltip;
+
+    if (iconAdded_) {
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = hwnd_;
+        nid.uID = kTrayIconId;
+        nid.uFlags = NIF_ICON | NIF_TIP;
+        nid.hIcon = icon_;
+        CopyTooltip(nid, tooltip_);
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    } else {
+        AddIcon();
+    }
+
+    if (oldIcon) DestroyIcon(oldIcon);
+}
+
+bool TrayIcon::AddIcon() {
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd_;
+    nid.uID = kTrayIconId;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = kTrayMessage;
+    nid.hIcon = icon_;
+    CopyTooltip(nid, tooltip_);
+
+    iconAdded_ = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+    if (iconAdded_) {
+        // Version 4 behavior: WM_CONTEXTMENU / NIN_SELECT notifications and
+        // screen coordinates of the click in wParam.
+        nid.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    }
+    return iconAdded_;
+}
+
+void TrayIcon::RemoveIcon() {
+    if (!iconAdded_) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd_;
+    nid.uID = kTrayIconId;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    iconAdded_ = false;
+}
+
+void TrayIcon::ShowContextMenu(int x, int y) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, kCmdRefresh, L"Refresh");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCmdExit, L"Exit");
+
+    // Required so the menu closes when the user clicks elsewhere.
+    SetForegroundWindow(hwnd_);
+    const UINT command = static_cast<UINT>(
+        TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, x, y, 0, hwnd_,
+                       nullptr));
+    PostMessageW(hwnd_, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+
+    if (command == kCmdRefresh) {
+        if (callbacks_.onRefresh) callbacks_.onRefresh();
+    } else if (command == kCmdExit) {
+        DestroyWindow(hwnd_);
+    }
+}
+
+LRESULT CALLBACK TrayIcon::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    TrayIcon* self = nullptr;
+    if (msg == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        self = static_cast<TrayIcon*>(create->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        if (self) self->hwnd_ = hwnd;
+    } else {
+        self = reinterpret_cast<TrayIcon*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+
+    if (!self) return DefWindowProcW(hwnd, msg, wParam, lParam);
+    return self->HandleMessage(hwnd, msg, wParam, lParam);
+}
+
+LRESULT TrayIcon::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (taskbarCreatedMsg_ != 0 && msg == taskbarCreatedMsg_) {
+        iconAdded_ = false;  // Explorer restarted; the old icon is gone
+        AddIcon();
+        return 0;
+    }
+
+    switch (msg) {
+    case kTrayMessage:
+        switch (LOWORD(lParam)) {
+        case NIN_SELECT:
+        case NIN_KEYSELECT:
+            if (callbacks_.onRefresh) callbacks_.onRefresh();
+            break;
+        case WM_CONTEXTMENU:
+            ShowContextMenu(static_cast<int>(static_cast<short>(LOWORD(wParam))),
+                            static_cast<int>(static_cast<short>(HIWORD(wParam))));
+            break;
+        default:
+            break;
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == kTimerId && callbacks_.onRefresh) callbacks_.onRefresh();
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(hwnd_, kTimerId);
+        RemoveIcon();
+        hwnd_ = nullptr;
+        PostQuitMessage(0);
+        return 0;
+
+    default:
+        if (msg >= WM_APP && msg <= 0xBFFF && callbacks_.onMessage &&
+            callbacks_.onMessage(msg, wParam, lParam)) {
+            return 0;
+        }
+        break;
+    }
+
+    // Use the parameter, not hwnd_: hwnd_ is already null during WM_NCDESTROY.
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
